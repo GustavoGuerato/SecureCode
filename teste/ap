@@ -1,0 +1,379 @@
+// ============================================================
+//  DistributedCore.cs
+//  Ecossistema de serviços distribuídos — core conceitual
+//  Cobre: RPC, Service Discovery, Load Balancing
+// ============================================================
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+// ────────────────────────────────────────────────────────────
+// 1. PRIMITIVOS COMPARTILHADOS
+// ────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Envelope genérico de request RPC.
+/// Equivale ao proto.Message do gRPC.
+/// </summary>
+public sealed record RpcRequest(
+    string ServiceName,   // "UserService"
+    string Method,        // "GetUser"
+    string Payload,       // JSON / bytes simulados
+    string RequestId = ""
+)
+{
+    public string RequestId { get; init; } = RequestId == "" ? Guid.NewGuid().ToString("N")[..8] : RequestId;
+}
+
+/// <summary>
+/// Envelope genérico de response RPC.
+/// </summary>
+public sealed record RpcResponse(
+    string RequestId,
+    bool   Success,
+    string Payload,
+    string Error = ""
+);
+
+// ────────────────────────────────────────────────────────────
+// 2. SERVICE REGISTRY  (equivalente ao Consul / Zookeeper)
+// ────────────────────────────────────────────────────────────
+
+public sealed class ServiceEndpoint
+{
+    public string Id          { get; }        // "user-svc-01"
+    public string ServiceName { get; }        // "UserService"
+    public string Address     { get; }        // "10.0.0.1:8080" (simulado)
+    public bool   IsHealthy   { get; set; } = true;
+    public int    ActiveConns { get; set; } = 0;  // para least-connections
+
+    public ServiceEndpoint(string id, string serviceName, string address)
+    {
+        Id          = id;
+        ServiceName = serviceName;
+        Address     = address;
+    }
+
+    public override string ToString() => $"[{Id}@{Address} healthy={IsHealthy} conns={ActiveConns}]";
+}
+
+/// <summary>
+/// Service Registry em memória.
+/// Mantém o mapa de nome → lista de instâncias.
+/// </summary>
+public sealed class ServiceRegistry
+{
+    private readonly ConcurrentDictionary<string, List<ServiceEndpoint>> _services = new();
+    private readonly ReaderWriterLockSlim _lock = new();
+
+    // Registra uma nova instância (equivale ao gRPC NameResolver / Consul Register)
+    public void Register(ServiceEndpoint endpoint)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (!_services.TryGetValue(endpoint.ServiceName, out var list))
+            {
+                list = new List<ServiceEndpoint>();
+                _services[endpoint.ServiceName] = list;
+            }
+            list.Add(endpoint);
+            Console.WriteLine($"[Registry] Registered {endpoint}");
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
+    // Remove instância (graceful shutdown / deregistro)
+    public void Deregister(string serviceId)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            foreach (var list in _services.Values)
+                list.RemoveAll(e => e.Id == serviceId);
+            Console.WriteLine($"[Registry] Deregistered {serviceId}");
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
+    // Retorna snapshot das instâncias saudáveis para um serviço
+    public IReadOnlyList<ServiceEndpoint> Resolve(string serviceName)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            if (!_services.TryGetValue(serviceName, out var list))
+                return Array.Empty<ServiceEndpoint>();
+
+            return list.Where(e => e.IsHealthy).ToList();
+        }
+        finally { _lock.ExitReadLock(); }
+    }
+
+    // Simula um health-check periódico (toggle aleatório para demo)
+    public void SimulateHealthCheck()
+    {
+        var rng = new Random();
+        _lock.EnterWriteLock();
+        try
+        {
+            foreach (var list in _services.Values)
+                foreach (var ep in list)
+                    ep.IsHealthy = rng.NextDouble() > 0.15; // 85% up
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// 3. LOAD BALANCER  (Round-Robin + Least-Connections + Random)
+// ────────────────────────────────────────────────────────────
+
+public enum LbStrategy { RoundRobin, LeastConnections, Random }
+
+public sealed class LoadBalancer
+{
+    private readonly ServiceRegistry _registry;
+    private readonly LbStrategy      _strategy;
+    private readonly ConcurrentDictionary<string, int> _rrCounters = new();
+    private readonly Random _rng = new();
+
+    public LoadBalancer(ServiceRegistry registry, LbStrategy strategy = LbStrategy.RoundRobin)
+    {
+        _registry = registry;
+        _strategy = strategy;
+    }
+
+    /// <summary>
+    /// Escolhe um endpoint para o serviço informado.
+    /// Retorna null se não há instâncias saudáveis.
+    /// </summary>
+    public ServiceEndpoint? Pick(string serviceName)
+    {
+        var candidates = _registry.Resolve(serviceName);
+        if (candidates.Count == 0) return null;
+
+        return _strategy switch
+        {
+            LbStrategy.RoundRobin       => PickRoundRobin(serviceName, candidates),
+            LbStrategy.LeastConnections => PickLeastConn(candidates),
+            LbStrategy.Random           => candidates[_rng.Next(candidates.Count)],
+            _                           => candidates[0]
+        };
+    }
+
+    private ServiceEndpoint PickRoundRobin(string svc, IReadOnlyList<ServiceEndpoint> list)
+    {
+        var idx = _rrCounters.AddOrUpdate(svc, 0, (_, old) => (old + 1) % list.Count);
+        return list[idx];
+    }
+
+    private ServiceEndpoint PickLeastConn(IReadOnlyList<ServiceEndpoint> list)
+        => list.MinBy(e => e.ActiveConns)!;
+}
+
+// ────────────────────────────────────────────────────────────
+// 4. RPC CHANNEL  (stub local que simula serialização + envio)
+// ────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Interface que todo serviço concreto deve implementar.
+/// Equivale ao ServiceImpl no lado servidor do gRPC.
+/// </summary>
+public interface IRpcHandler
+{
+    string ServiceName { get; }
+    Task<RpcResponse> HandleAsync(RpcRequest request);
+}
+
+/// <summary>
+/// Canal RPC em memória.
+/// Numa implementação real: abre socket TCP, serializa proto, etc.
+/// Aqui despacha direto para o handler registrado.
+/// </summary>
+public sealed class RpcChannel
+{
+    private readonly LoadBalancer _lb;
+    // Handlers registrados localmente (simula processos remotos)
+    private readonly Dictionary<string, IRpcHandler> _localHandlers = new();
+
+    public RpcChannel(LoadBalancer lb) => _lb = lb;
+
+    public void RegisterHandler(IRpcHandler handler)
+        => _localHandlers[handler.ServiceName] = handler;
+
+    /// <summary>
+    /// Envia request RPC com retry simples (até 3 tentativas).
+    /// </summary>
+    public async Task<RpcResponse> CallAsync(RpcRequest request, int maxRetries = 3)
+    {
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            var endpoint = _lb.Pick(request.ServiceName);
+            if (endpoint is null)
+                return new RpcResponse(request.RequestId, false, "", "No healthy endpoints");
+
+            try
+            {
+                endpoint.ActiveConns++;
+                Console.WriteLine($"[RPC] #{request.RequestId} → {request.ServiceName}.{request.Method} via {endpoint.Id} (attempt {attempt})");
+
+                // Simula latência de rede
+                await Task.Delay(Random.Shared.Next(10, 60));
+
+                if (!_localHandlers.TryGetValue(request.ServiceName, out var handler))
+                    return new RpcResponse(request.RequestId, false, "", "Handler not found");
+
+                var response = await handler.HandleAsync(request);
+                Console.WriteLine($"[RPC] #{request.RequestId} ← {(response.Success ? "OK" : "ERR: " + response.Error)}");
+                return response;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[RPC] #{request.RequestId} attempt {attempt} failed: {ex.Message}");
+                endpoint.IsHealthy = false; // marca endpoint como doente
+            }
+            finally
+            {
+                endpoint.ActiveConns = Math.Max(0, endpoint.ActiveConns - 1);
+            }
+        }
+
+        return new RpcResponse(request.RequestId, false, "", "All retries exhausted");
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// 5. SERVIÇOS DE EXEMPLO
+// ────────────────────────────────────────────────────────────
+
+/// <summary>Serviço fictício de usuários.</summary>
+public sealed class UserService : IRpcHandler
+{
+    public string ServiceName => "UserService";
+
+    private static readonly Dictionary<string, string> _db = new()
+    {
+        ["1"] = """{"id":"1","name":"Gustavo","role":"dev"}""",
+        ["2"] = """{"id":"2","name":"Ana","role":"sre"}""",
+    };
+
+    public Task<RpcResponse> HandleAsync(RpcRequest req)
+    {
+        var result = req.Method switch
+        {
+            "GetUser" => _db.TryGetValue(req.Payload, out var user)
+                            ? new RpcResponse(req.RequestId, true, user)
+                            : new RpcResponse(req.RequestId, false, "", "User not found"),
+
+            "ListUsers" => new RpcResponse(req.RequestId, true,
+                               $"[{string.Join(",", _db.Values)}]"),
+
+            _ => new RpcResponse(req.RequestId, false, "", $"Unknown method: {req.Method}")
+        };
+
+        return Task.FromResult(result);
+    }
+}
+
+/// <summary>Serviço fictício de produtos.</summary>
+public sealed class ProductService : IRpcHandler
+{
+    public string ServiceName => "ProductService";
+
+    public Task<RpcResponse> HandleAsync(RpcRequest req)
+    {
+        var payload = req.Method switch
+        {
+            "GetProduct" => $"""{{ "id":"{req.Payload}", "name":"Widget #{req.Payload}", "price":9.99 }}""",
+            _            => null
+        };
+
+        var response = payload is not null
+            ? new RpcResponse(req.RequestId, true, payload)
+            : new RpcResponse(req.RequestId, false, "", $"Unknown method: {req.Method}");
+
+        return Task.FromResult(response);
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// 6. BOOTSTRAP / DEMO
+// ────────────────────────────────────────────────────────────
+
+public static class Program
+{
+    public static async Task Main()
+    {
+        Console.WriteLine("=== Distributed Services Core ===\n");
+
+        // --- Registry ---
+        var registry = new ServiceRegistry();
+
+        // Registra 3 instâncias do UserService e 2 do ProductService
+        registry.Register(new ServiceEndpoint("user-01", "UserService",    "10.0.0.1:9000"));
+        registry.Register(new ServiceEndpoint("user-02", "UserService",    "10.0.0.2:9000"));
+        registry.Register(new ServiceEndpoint("user-03", "UserService",    "10.0.0.3:9000"));
+        registry.Register(new ServiceEndpoint("prod-01", "ProductService", "10.0.0.4:9001"));
+        registry.Register(new ServiceEndpoint("prod-02", "ProductService", "10.0.0.5:9001"));
+
+        // --- Load Balancer ---
+        var lb = new LoadBalancer(registry, LbStrategy.RoundRobin);
+
+        // --- Canal RPC ---
+        var channel = new RpcChannel(lb);
+        channel.RegisterHandler(new UserService());
+        channel.RegisterHandler(new ProductService());
+
+        // --- Disparar chamadas concorrentes ---
+        Console.WriteLine("\n--- Chamadas RPC concorrentes ---\n");
+
+        var tasks = new List<Task<RpcResponse>>
+        {
+            channel.CallAsync(new RpcRequest("UserService",    "GetUser",    "1")),
+            channel.CallAsync(new RpcRequest("UserService",    "GetUser",    "2")),
+            channel.CallAsync(new RpcRequest("UserService",    "ListUsers",  "")),
+            channel.CallAsync(new RpcRequest("UserService",    "GetUser",    "99")), // not found
+            channel.CallAsync(new RpcRequest("ProductService", "GetProduct", "42")),
+            channel.CallAsync(new RpcRequest("ProductService", "GetProduct", "7")),
+            channel.CallAsync(new RpcRequest("ProductService", "DeleteAll",  "")),  // unknown method
+        };
+
+        var results = await Task.WhenAll(tasks);
+
+        Console.WriteLine("\n--- Resultados ---\n");
+        foreach (var r in results)
+        {
+            var status = r.Success ? "✓" : "✗";
+            var body   = r.Success ? r.Payload : r.Error;
+            Console.WriteLine($"  {status} [{r.RequestId}] {body}");
+        }
+
+        // --- Simula health check e nova rodada ---
+        Console.WriteLine("\n--- Health check simulado ---\n");
+        registry.SimulateHealthCheck();
+
+        Console.WriteLine("Endpoints após health check:");
+        foreach (var ep in registry.Resolve("UserService"))
+            Console.WriteLine($"  {ep}");
+
+        // Resolve() com Least-Connections
+        var lb2    = new LoadBalancer(registry, LbStrategy.LeastConnections);
+        var ch2    = new RpcChannel(lb2);
+        ch2.RegisterHandler(new UserService());
+
+        Console.WriteLine("\n--- Least-Connections LB ---\n");
+        var lc = await Task.WhenAll(
+            ch2.CallAsync(new RpcRequest("UserService", "GetUser", "1")),
+            ch2.CallAsync(new RpcRequest("UserService", "GetUser", "2"))
+        );
+        foreach (var r in lc)
+            Console.WriteLine($"  [{r.RequestId}] {(r.Success ? r.Payload : r.Error)}");
+
+        Console.WriteLine("\n=== Done ===");
+    }
+}
