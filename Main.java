@@ -4,22 +4,17 @@ public class Main {
 
     public static void main(String[] args) {
 
-        String input =
-            "REGRA BLOCK_ACCESS NIVEL BAIXA SE TOKEN CONTAINS \"admin\" AND USER_ROLE EQUALS \"guest\" ACAO REJEITAR FIM";
+        String input = "REGRA BLOCK_ACCESS NIVEL BAIXA SE TOKEN CONTAINS \"admin\" AND USER_ROLE EQUALS \"guest\" ACAO REJEITAR FIM";
 
-        // Lexer + Parser
         Lexer lexer = new Lexer(input);
         Parser parser = new Parser(lexer.tokenize());
         List<Rule> rules = parser.parse();
 
-        // Semantic
         SemanticAnalyzer analyzer = new SemanticAnalyzer();
         analyzer.analyze(rules);
 
-        // Engine
         RuleEngine engine = new RuleEngine();
 
-        // CLI
         Scanner scanner = new Scanner(System.in);
 
         System.out.println("\nSecureCode CLI started (type 'exit' to quit)");
@@ -51,7 +46,6 @@ public class Main {
         scanner.close();
     }
 
-  
     private static Map<String, String> parseLogStrict(String line) {
 
         Map<String, String> context = new HashMap<>();
@@ -60,7 +54,6 @@ public class Main {
 
         for (String p : parts) {
 
-            // ignora tokens inválidos
             if (!p.contains("=")) {
                 System.out.println("[WARN] invalid token ignored: " + p);
                 continue;
