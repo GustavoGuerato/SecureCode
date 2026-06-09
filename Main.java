@@ -51,13 +51,7 @@ public class Main {
         scanner.close();
     }
 
-    /**
-     * Modo "strict but safe":
-     * - aceita apenas KEY=VALUE
-     * - ignora lixo
-     * - não quebra runtime
-     * - loga erros de forma controlada
-     */
+  
     private static Map<String, String> parseLogStrict(String line) {
 
         Map<String, String> context = new HashMap<>();

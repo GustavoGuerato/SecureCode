@@ -1,76 +1,264 @@
+stributedcore · CS
 // ============================================================
-//  DistributedCore.cs
+//  DistributedCore.cs  (v2)
 //  Ecossistema de serviços distribuídos — core conceitual
-//  Cobre: RPC, Service Discovery, Load Balancing
+//  Cobre: RPC, Service Discovery, Load Balancing,
+//         Circuit Breaker, Middleware Pipeline,
+//         Retry com Backoff Exponencial + Jitter,
+//         Métricas, Health Check ativo (background loop)
 // ============================================================
-
+ 
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-
+ 
 // ────────────────────────────────────────────────────────────
 // 1. PRIMITIVOS COMPARTILHADOS
 // ────────────────────────────────────────────────────────────
-
+ 
 /// <summary>
 /// Envelope genérico de request RPC.
-/// Equivale ao proto.Message do gRPC.
+/// Contém metadados de rastreamento (trace/span IDs) para
+/// simular distributed tracing estilo OpenTelemetry.
 /// </summary>
 public sealed record RpcRequest(
-    string ServiceName,   // "UserService"
-    string Method,        // "GetUser"
-    string Payload,       // JSON / bytes simulados
-    string RequestId = ""
+    string ServiceName,
+    string Method,
+    string Payload,
+    string RequestId  = "",
+    string TraceId    = "",
+    string SpanId     = "",
+    IDictionary<string, string>? Metadata = null
 )
 {
-    public string RequestId { get; init; } = RequestId == "" ? Guid.NewGuid().ToString("N")[..8] : RequestId;
+    public string RequestId { get; init; } =
+        RequestId == "" ? Guid.NewGuid().ToString("N")[..8] : RequestId;
+ 
+    public string TraceId { get; init; } =
+        TraceId == "" ? Guid.NewGuid().ToString("N")[..16] : TraceId;
+ 
+    public string SpanId { get; init; } =
+        SpanId == "" ? Guid.NewGuid().ToString("N")[..8] : SpanId;
+ 
+    /// <summary>Cria um child-span para propagação de contexto.</summary>
+    public RpcRequest WithChildSpan() =>
+        this with { SpanId = Guid.NewGuid().ToString("N")[..8] };
 }
-
+ 
 /// <summary>
-/// Envelope genérico de response RPC.
+/// Envelope genérico de response.
+/// Inclui código de status inspirado nos status codes do gRPC.
 /// </summary>
 public sealed record RpcResponse(
-    string RequestId,
-    bool   Success,
-    string Payload,
-    string Error = ""
+    string     RequestId,
+    bool       Success,
+    string     Payload,
+    string     Error      = "",
+    StatusCode Status     = StatusCode.Ok,
+    long       LatencyMs  = 0
 );
-
+ 
+public enum StatusCode
+{
+    Ok              = 0,
+    Cancelled       = 1,
+    Unknown         = 2,
+    InvalidArgument = 3,
+    NotFound        = 5,
+    Unavailable     = 14,
+    Internal        = 13,
+}
+ 
 // ────────────────────────────────────────────────────────────
-// 2. SERVICE REGISTRY  (equivalente ao Consul / Zookeeper)
+// 2. MÉTRICAS
 // ────────────────────────────────────────────────────────────
-
+ 
+/// <summary>
+/// Coletador de métricas em memória.
+/// Num sistema real seria exposto via /metrics para Prometheus.
+/// </summary>
+public sealed class MetricsCollector
+{
+    // Contadores por (service, method)
+    private readonly ConcurrentDictionary<string, long> _counters  = new();
+    // Histograma simples de latência (lista de samples)
+    private readonly ConcurrentDictionary<string, ConcurrentBag<long>> _latencies = new();
+ 
+    public void Increment(string service, string method, bool success)
+    {
+        var key = $"{service}.{method}.{(success ? "ok" : "err")}";
+        _counters.AddOrUpdate(key, 1, (_, v) => v + 1);
+    }
+ 
+    public void RecordLatency(string service, string method, long ms)
+    {
+        var key = $"{service}.{method}";
+        _latencies.GetOrAdd(key, _ => new ConcurrentBag<long>()).Add(ms);
+    }
+ 
+    public void PrintReport()
+    {
+        Console.WriteLine("\n╔══════════════════ MÉTRICAS ══════════════════╗");
+ 
+        Console.WriteLine("  Counters:");
+        foreach (var (k, v) in _counters.OrderBy(x => x.Key))
+            Console.WriteLine($"    {k,-45} {v,6}");
+ 
+        Console.WriteLine("  Latências (p50 / p95 / p99) [ms]:");
+        foreach (var (k, bag) in _latencies.OrderBy(x => x.Key))
+        {
+            var sorted = bag.OrderBy(x => x).ToArray();
+            if (sorted.Length == 0) continue;
+            Console.WriteLine($"    {k,-35}  p50={Percentile(sorted, 50),4}  p95={Percentile(sorted, 95),4}  p99={Percentile(sorted, 99),4}");
+        }
+ 
+        Console.WriteLine("╚═══════════════════════════════════════════════╝\n");
+    }
+ 
+    private static long Percentile(long[] sorted, int p)
+    {
+        var idx = (int)Math.Ceiling(p / 100.0 * sorted.Length) - 1;
+        return sorted[Math.Clamp(idx, 0, sorted.Length - 1)];
+    }
+}
+ 
+// ────────────────────────────────────────────────────────────
+// 3. CIRCUIT BREAKER  (estado: Closed → Open → Half-Open)
+// ────────────────────────────────────────────────────────────
+ 
+public enum CircuitState { Closed, Open, HalfOpen }
+ 
+/// <summary>
+/// Circuit Breaker por endpoint.
+/// Abre após N falhas consecutivas; tenta fechar após cooldown.
+/// Padrão clássico de Nygard / Martin Fowler.
+/// </summary>
+public sealed class CircuitBreaker
+{
+    private readonly int      _failureThreshold;
+    private readonly TimeSpan _cooldown;
+ 
+    private int           _consecutiveFailures;
+    private CircuitState  _state = CircuitState.Closed;
+    private DateTime      _openedAt;
+    private readonly object _mu = new();
+ 
+    public string EndpointId { get; }
+    public CircuitState State { get { lock (_mu) return _state; } }
+ 
+    public CircuitBreaker(string endpointId, int failureThreshold = 3,
+                          TimeSpan? cooldown = null)
+    {
+        EndpointId        = endpointId;
+        _failureThreshold = failureThreshold;
+        _cooldown         = cooldown ?? TimeSpan.FromSeconds(5);
+    }
+ 
+    /// <returns>true se a chamada pode prosseguir.</returns>
+    public bool AllowRequest()
+    {
+        lock (_mu)
+        {
+            switch (_state)
+            {
+                case CircuitState.Closed:
+                    return true;
+ 
+                case CircuitState.Open:
+                    if (DateTime.UtcNow - _openedAt >= _cooldown)
+                    {
+                        _state = CircuitState.HalfOpen;
+                        Console.WriteLine($"  [CB:{EndpointId}] → HalfOpen (testando...)");
+                        return true;  // deixa uma requisição de sonda passar
+                    }
+                    return false;
+ 
+                case CircuitState.HalfOpen:
+                    return true;
+ 
+                default:
+                    return false;
+            }
+        }
+    }
+ 
+    public void RecordSuccess()
+    {
+        lock (_mu)
+        {
+            _consecutiveFailures = 0;
+            if (_state == CircuitState.HalfOpen)
+            {
+                _state = CircuitState.Closed;
+                Console.WriteLine($"  [CB:{EndpointId}] → Closed ✓");
+            }
+        }
+    }
+ 
+    public void RecordFailure()
+    {
+        lock (_mu)
+        {
+            _consecutiveFailures++;
+            if (_state == CircuitState.HalfOpen || _consecutiveFailures >= _failureThreshold)
+            {
+                _state    = CircuitState.Open;
+                _openedAt = DateTime.UtcNow;
+                Console.WriteLine($"  [CB:{EndpointId}] → Open (falhas={_consecutiveFailures})");
+            }
+        }
+    }
+}
+ 
+// ────────────────────────────────────────────────────────────
+// 4. SERVICE REGISTRY + HEALTH CHECK ATIVO
+// ────────────────────────────────────────────────────────────
+ 
 public sealed class ServiceEndpoint
 {
-    public string Id          { get; }        // "user-svc-01"
-    public string ServiceName { get; }        // "UserService"
-    public string Address     { get; }        // "10.0.0.1:8080" (simulado)
+    public string Id          { get; }
+    public string ServiceName { get; }
+    public string Address     { get; }
     public bool   IsHealthy   { get; set; } = true;
-    public int    ActiveConns { get; set; } = 0;  // para least-connections
-
-    public ServiceEndpoint(string id, string serviceName, string address)
+    public int    ActiveConns { get; set; } = 0;
+    public int    Weight      { get; init; } = 1;     // para Weighted Round-Robin futuro
+ 
+    // Circuit Breaker dedicado por endpoint
+    public CircuitBreaker CircuitBreaker { get; } = default!;
+ 
+    public ServiceEndpoint(string id, string serviceName, string address,
+                           int failureThreshold = 3)
     {
-        Id          = id;
-        ServiceName = serviceName;
-        Address     = address;
+        Id            = id;
+        ServiceName   = serviceName;
+        Address       = address;
+        CircuitBreaker = new CircuitBreaker(id, failureThreshold);
     }
-
-    public override string ToString() => $"[{Id}@{Address} healthy={IsHealthy} conns={ActiveConns}]";
+ 
+    public override string ToString() =>
+        $"[{Id}@{Address} healthy={IsHealthy} conns={ActiveConns} cb={CircuitBreaker.State}]";
 }
-
-/// <summary>
-/// Service Registry em memória.
-/// Mantém o mapa de nome → lista de instâncias.
-/// </summary>
-public sealed class ServiceRegistry
+ 
+public sealed class ServiceRegistry : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, List<ServiceEndpoint>> _services = new();
     private readonly ReaderWriterLockSlim _lock = new();
-
-    // Registra uma nova instância (equivale ao gRPC NameResolver / Consul Register)
+ 
+    // Health-check periódico em background
+    private readonly CancellationTokenSource _cts = new();
+    private readonly Task _healthLoop;
+ 
+    public ServiceRegistry(TimeSpan? healthCheckInterval = null)
+    {
+        var interval = healthCheckInterval ?? TimeSpan.FromSeconds(3);
+        _healthLoop  = RunHealthCheckLoopAsync(interval, _cts.Token);
+    }
+ 
     public void Register(ServiceEndpoint endpoint)
     {
         _lock.EnterWriteLock();
@@ -86,8 +274,7 @@ public sealed class ServiceRegistry
         }
         finally { _lock.ExitWriteLock(); }
     }
-
-    // Remove instância (graceful shutdown / deregistro)
+ 
     public void Deregister(string serviceId)
     {
         _lock.EnterWriteLock();
@@ -99,8 +286,10 @@ public sealed class ServiceRegistry
         }
         finally { _lock.ExitWriteLock(); }
     }
-
-    // Retorna snapshot das instâncias saudáveis para um serviço
+ 
+    /// <summary>
+    /// Retorna endpoints saudáveis E com Circuit Breaker não-Open.
+    /// </summary>
     public IReadOnlyList<ServiceEndpoint> Resolve(string serviceName)
     {
         _lock.EnterReadLock();
@@ -108,272 +297,628 @@ public sealed class ServiceRegistry
         {
             if (!_services.TryGetValue(serviceName, out var list))
                 return Array.Empty<ServiceEndpoint>();
-
-            return list.Where(e => e.IsHealthy).ToList();
+ 
+            return list
+                .Where(e => e.IsHealthy && e.CircuitBreaker.State != CircuitState.Open)
+                .ToList();
         }
         finally { _lock.ExitReadLock(); }
     }
-
-    // Simula um health-check periódico (toggle aleatório para demo)
-    public void SimulateHealthCheck()
+ 
+    /// <summary>Retorna TODOS os endpoints (para inspeção).</summary>
+    public IReadOnlyList<ServiceEndpoint> All(string serviceName)
     {
-        var rng = new Random();
-        _lock.EnterWriteLock();
+        _lock.EnterReadLock();
         try
         {
-            foreach (var list in _services.Values)
-                foreach (var ep in list)
-                    ep.IsHealthy = rng.NextDouble() > 0.15; // 85% up
+            return _services.TryGetValue(serviceName, out var list)
+                ? list.ToList()
+                : Array.Empty<ServiceEndpoint>();
         }
-        finally { _lock.ExitWriteLock(); }
+        finally { _lock.ExitReadLock(); }
+    }
+ 
+    // ── Health-check loop ────────────────────────────────────
+    // Numa implementação real faria HTTP GET /health ou TCP ping.
+    // Aqui simulamos probabilisticamente.
+    private async Task RunHealthCheckLoopAsync(TimeSpan interval, CancellationToken ct)
+    {
+        var rng = new Random();
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(interval, ct).ConfigureAwait(false);
+ 
+            _lock.EnterWriteLock();
+            try
+            {
+                foreach (var list in _services.Values)
+                    foreach (var ep in list)
+                    {
+                        var wasHealthy = ep.IsHealthy;
+                        ep.IsHealthy = rng.NextDouble() > 0.12; // ~88% up-time
+                        if (wasHealthy && !ep.IsHealthy)
+                            Console.WriteLine($"  [HealthCheck] {ep.Id} → DOWN");
+                        else if (!wasHealthy && ep.IsHealthy)
+                            Console.WriteLine($"  [HealthCheck] {ep.Id} → UP");
+                    }
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+    }
+ 
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        try { await _healthLoop.ConfigureAwait(false); }
+        catch (OperationCanceledException) { /* esperado */ }
+        _lock.Dispose();
     }
 }
-
+ 
 // ────────────────────────────────────────────────────────────
-// 3. LOAD BALANCER  (Round-Robin + Least-Connections + Random)
+// 5. LOAD BALANCER
 // ────────────────────────────────────────────────────────────
-
-public enum LbStrategy { RoundRobin, LeastConnections, Random }
-
+ 
+public enum LbStrategy { RoundRobin, LeastConnections, Random, PowerOfTwo }
+ 
 public sealed class LoadBalancer
 {
     private readonly ServiceRegistry _registry;
     private readonly LbStrategy      _strategy;
     private readonly ConcurrentDictionary<string, int> _rrCounters = new();
     private readonly Random _rng = new();
-
-    public LoadBalancer(ServiceRegistry registry, LbStrategy strategy = LbStrategy.RoundRobin)
+ 
+    public LoadBalancer(ServiceRegistry registry,
+                        LbStrategy strategy = LbStrategy.RoundRobin)
     {
         _registry = registry;
         _strategy = strategy;
     }
-
-    /// <summary>
-    /// Escolhe um endpoint para o serviço informado.
-    /// Retorna null se não há instâncias saudáveis.
-    /// </summary>
+ 
+    /// <returns>Endpoint escolhido ou null se indisponível.</returns>
     public ServiceEndpoint? Pick(string serviceName)
     {
         var candidates = _registry.Resolve(serviceName);
         if (candidates.Count == 0) return null;
-
+ 
         return _strategy switch
         {
             LbStrategy.RoundRobin       => PickRoundRobin(serviceName, candidates),
             LbStrategy.LeastConnections => PickLeastConn(candidates),
             LbStrategy.Random           => candidates[_rng.Next(candidates.Count)],
+            LbStrategy.PowerOfTwo       => PickPowerOfTwo(candidates),  // P2C
             _                           => candidates[0]
         };
     }
-
-    private ServiceEndpoint PickRoundRobin(string svc, IReadOnlyList<ServiceEndpoint> list)
+ 
+    private ServiceEndpoint PickRoundRobin(string svc,
+                                           IReadOnlyList<ServiceEndpoint> list)
     {
-        var idx = _rrCounters.AddOrUpdate(svc, 0, (_, old) => (old + 1) % list.Count);
+        var idx = _rrCounters.AddOrUpdate(
+            svc, 0, (_, old) => (old + 1) % list.Count);
         return list[idx];
     }
-
-    private ServiceEndpoint PickLeastConn(IReadOnlyList<ServiceEndpoint> list)
+ 
+    private static ServiceEndpoint PickLeastConn(IReadOnlyList<ServiceEndpoint> list)
         => list.MinBy(e => e.ActiveConns)!;
+ 
+    /// <summary>
+    /// Power of Two Choices: sorteia 2 candidatos aleatórios
+    /// e escolhe o de menor carga. Melhor que LeastConn puro
+    /// em clusters grandes (menor contenção).
+    /// </summary>
+    private ServiceEndpoint PickPowerOfTwo(IReadOnlyList<ServiceEndpoint> list)
+    {
+        if (list.Count == 1) return list[0];
+        int i = _rng.Next(list.Count);
+        int j;
+        do { j = _rng.Next(list.Count); } while (j == i);
+        return list[i].ActiveConns <= list[j].ActiveConns ? list[i] : list[j];
+    }
 }
-
+ 
 // ────────────────────────────────────────────────────────────
-// 4. RPC CHANNEL  (stub local que simula serialização + envio)
+// 6. MIDDLEWARE PIPELINE
 // ────────────────────────────────────────────────────────────
-
+ 
+public delegate Task<RpcResponse> RpcDelegate(RpcRequest request);
+public delegate Task<RpcResponse> RpcMiddleware(RpcRequest request, RpcDelegate next);
+ 
 /// <summary>
-/// Interface que todo serviço concreto deve implementar.
-/// Equivale ao ServiceImpl no lado servidor do gRPC.
+/// Pipeline de middlewares inspirado no ASP.NET Core IMiddleware.
+/// Cada middleware pode inspecionar/modificar request e response,
+/// ou curto-circuitar a chain.
 /// </summary>
+public sealed class MiddlewarePipeline
+{
+    private readonly List<RpcMiddleware> _middlewares = new();
+    private RpcDelegate? _compiled;
+ 
+    public MiddlewarePipeline Use(RpcMiddleware middleware)
+    {
+        _middlewares.Add(middleware);
+        _compiled = null;   // invalida cache
+        return this;
+    }
+ 
+    /// <summary>
+    /// Constrói a chain de forma similar ao Compose funcional:
+    /// M1(M2(M3(handler)))
+    /// </summary>
+    public RpcDelegate Build(RpcDelegate handler)
+    {
+        if (_compiled is not null) return _compiled;
+ 
+        RpcDelegate pipeline = handler;
+        for (int i = _middlewares.Count - 1; i >= 0; i--)
+        {
+            var mw   = _middlewares[i];
+            var next = pipeline;
+            pipeline = req => mw(req, next);
+        }
+        _compiled = pipeline;
+        return pipeline;
+    }
+}
+ 
+// Middlewares concretos ──────────────────────────────────────
+ 
+/// <summary>Loga request/response com trace context.</summary>
+public static class LoggingMiddleware
+{
+    public static async Task<RpcResponse> InvokeAsync(
+        RpcRequest req, RpcDelegate next)
+    {
+        Console.WriteLine(
+            $"  → [{req.TraceId}/{req.SpanId}] {req.ServiceName}.{req.Method} " +
+            $"payload={Truncate(req.Payload, 32)}");
+ 
+        var sw  = Stopwatch.StartNew();
+        var res = await next(req);
+        sw.Stop();
+ 
+        Console.WriteLine(
+            $"  ← [{req.TraceId}/{req.SpanId}] {(res.Success ? "OK" : "ERR")} " +
+            $"{sw.ElapsedMilliseconds}ms");
+        return res with { LatencyMs = sw.ElapsedMilliseconds };
+    }
+ 
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+}
+ 
+/// <summary>
+/// Valida o request antes de enviar.
+/// Rejeita método vazio ou nome de serviço vazio.
+/// </summary>
+public static class ValidationMiddleware
+{
+    public static Task<RpcResponse> InvokeAsync(
+        RpcRequest req, RpcDelegate next)
+    {
+        if (string.IsNullOrWhiteSpace(req.ServiceName) ||
+            string.IsNullOrWhiteSpace(req.Method))
+        {
+            return Task.FromResult(new RpcResponse(
+                req.RequestId, false, "",
+                "Invalid request: ServiceName and Method are required",
+                StatusCode.InvalidArgument));
+        }
+        return next(req);
+    }
+}
+ 
+/// <summary>
+/// Middleware de timeout por request.
+/// Se o handler não responder a tempo, cancela e retorna erro.
+/// </summary>
+public sealed class TimeoutMiddleware
+{
+    private readonly TimeSpan _timeout;
+    public TimeoutMiddleware(TimeSpan timeout) => _timeout = timeout;
+ 
+    public async Task<RpcResponse> InvokeAsync(RpcRequest req, RpcDelegate next)
+    {
+        using var cts   = new CancellationTokenSource(_timeout);
+        var       inner = next(req);
+        var       delay = Task.Delay(_timeout, cts.Token);
+ 
+        var completed = await Task.WhenAny(inner, delay);
+        if (completed == delay)
+        {
+            return new RpcResponse(
+                req.RequestId, false, "",
+                $"Timeout after {_timeout.TotalMilliseconds}ms",
+                StatusCode.Cancelled);
+        }
+ 
+        cts.Cancel();        // cancela o delay se inner terminou primeiro
+        return await inner;
+    }
+}
+ 
+/// <summary>Coleta métricas de cada chamada.</summary>
+public sealed class MetricsMiddleware
+{
+    private readonly MetricsCollector _metrics;
+    public MetricsMiddleware(MetricsCollector metrics) => _metrics = metrics;
+ 
+    public async Task<RpcResponse> InvokeAsync(RpcRequest req, RpcDelegate next)
+    {
+        var sw  = Stopwatch.StartNew();
+        var res = await next(req);
+        sw.Stop();
+ 
+        _metrics.Increment(req.ServiceName, req.Method, res.Success);
+        _metrics.RecordLatency(req.ServiceName, req.Method, sw.ElapsedMilliseconds);
+        return res;
+    }
+}
+ 
+// ────────────────────────────────────────────────────────────
+// 7. POLÍTICA DE RETRY — Backoff Exponencial + Jitter
+// ────────────────────────────────────────────────────────────
+ 
+/// <summary>
+/// Configura a estratégia de retry para o RpcChannel.
+/// Usa full-jitter: delay = Random(0, base * 2^attempt)
+/// para evitar thundering herd.
+/// </summary>
+public sealed class RetryPolicy
+{
+    public int      MaxAttempts    { get; init; } = 3;
+    public TimeSpan BaseDelay      { get; init; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan MaxDelay       { get; init; } = TimeSpan.FromSeconds(2);
+    public double   Multiplier     { get; init; } = 2.0;
+ 
+    /// <summary>
+    /// Predicado: dado o código de status, vale a pena tentar de novo?
+    /// Não retenta InvalidArgument nem NotFound (erros do cliente).
+    /// </summary>
+    public static bool ShouldRetry(StatusCode code) =>
+        code is StatusCode.Unavailable or StatusCode.Unknown or StatusCode.Internal;
+ 
+    public TimeSpan ComputeDelay(int attempt)
+    {
+        // Exponential backoff com full-jitter (AWS pattern)
+        var cap   = Math.Min(MaxDelay.TotalMilliseconds,
+                             BaseDelay.TotalMilliseconds * Math.Pow(Multiplier, attempt));
+        var jitter = Random.Shared.NextDouble() * cap;
+        return TimeSpan.FromMilliseconds(jitter);
+    }
+}
+ 
+// ────────────────────────────────────────────────────────────
+// 8. HANDLER INTERFACE + RPC CHANNEL
+// ────────────────────────────────────────────────────────────
+ 
 public interface IRpcHandler
 {
     string ServiceName { get; }
     Task<RpcResponse> HandleAsync(RpcRequest request);
 }
-
-/// <summary>
-/// Canal RPC em memória.
-/// Numa implementação real: abre socket TCP, serializa proto, etc.
-/// Aqui despacha direto para o handler registrado.
-/// </summary>
+ 
 public sealed class RpcChannel
 {
-    private readonly LoadBalancer _lb;
-    // Handlers registrados localmente (simula processos remotos)
-    private readonly Dictionary<string, IRpcHandler> _localHandlers = new();
-
-    public RpcChannel(LoadBalancer lb) => _lb = lb;
-
-    public void RegisterHandler(IRpcHandler handler)
-        => _localHandlers[handler.ServiceName] = handler;
-
-    /// <summary>
-    /// Envia request RPC com retry simples (até 3 tentativas).
-    /// </summary>
-    public async Task<RpcResponse> CallAsync(RpcRequest request, int maxRetries = 3)
+    private readonly LoadBalancer      _lb;
+    private readonly RetryPolicy       _retryPolicy;
+    private readonly MiddlewarePipeline _pipeline;
+    private readonly Dictionary<string, IRpcHandler> _handlers = new();
+ 
+    public RpcChannel(LoadBalancer lb,
+                      RetryPolicy? retryPolicy = null,
+                      MiddlewarePipeline? pipeline = null)
     {
-        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        _lb          = lb;
+        _retryPolicy = retryPolicy ?? new RetryPolicy();
+        _pipeline    = pipeline    ?? new MiddlewarePipeline();
+    }
+ 
+    public void RegisterHandler(IRpcHandler handler)
+        => _handlers[handler.ServiceName] = handler;
+ 
+    /// <summary>
+    /// Executa o request através do middleware pipeline + retry.
+    /// </summary>
+    public Task<RpcResponse> CallAsync(RpcRequest request) =>
+        _pipeline.Build(CoreCallAsync)(request);
+ 
+    // Handler interno que contém a lógica de retry + CB
+    private async Task<RpcResponse> CoreCallAsync(RpcRequest request)
+    {
+        for (int attempt = 0; attempt < _retryPolicy.MaxAttempts; attempt++)
         {
+            if (attempt > 0)
+            {
+                var delay = _retryPolicy.ComputeDelay(attempt);
+                Console.WriteLine(
+                    $"  [Retry] #{request.RequestId} tentativa {attempt + 1}/{_retryPolicy.MaxAttempts} " +
+                    $"(delay={delay.TotalMilliseconds:F0}ms)");
+                await Task.Delay(delay);
+            }
+ 
             var endpoint = _lb.Pick(request.ServiceName);
             if (endpoint is null)
-                return new RpcResponse(request.RequestId, false, "", "No healthy endpoints");
-
+                return Fail(request, "No healthy endpoints", StatusCode.Unavailable);
+ 
+            // Circuit Breaker: aborta cedo se aberto
+            if (!endpoint.CircuitBreaker.AllowRequest())
+            {
+                Console.WriteLine($"  [CB:{endpoint.Id}] Blocked (Open)");
+                continue;   // tenta próximo endpoint no próximo ciclo
+            }
+ 
             try
             {
-                endpoint.ActiveConns++;
-                Console.WriteLine($"[RPC] #{request.RequestId} → {request.ServiceName}.{request.Method} via {endpoint.Id} (attempt {attempt})");
-
-                // Simula latência de rede
-                await Task.Delay(Random.Shared.Next(10, 60));
-
-                if (!_localHandlers.TryGetValue(request.ServiceName, out var handler))
-                    return new RpcResponse(request.RequestId, false, "", "Handler not found");
-
-                var response = await handler.HandleAsync(request);
-                Console.WriteLine($"[RPC] #{request.RequestId} ← {(response.Success ? "OK" : "ERR: " + response.Error)}");
+                Interlocked.Increment(ref endpoint.ActiveConns);
+ 
+                // Simula latência de rede + falhas ocasionais
+                await SimulateNetworkAsync(endpoint);
+ 
+                if (!_handlers.TryGetValue(request.ServiceName, out var handler))
+                    return Fail(request, "Handler not registered", StatusCode.Internal);
+ 
+                var response = await handler.HandleAsync(
+                    request.WithChildSpan());
+ 
+                endpoint.CircuitBreaker.RecordSuccess();
                 return response;
             }
-            catch (Exception ex)
+            catch (SimulatedNetworkException ex)
             {
-                Console.WriteLine($"[RPC] #{request.RequestId} attempt {attempt} failed: {ex.Message}");
-                endpoint.IsHealthy = false; // marca endpoint como doente
+                Console.WriteLine($"  [Net] {endpoint.Id} erro: {ex.Message}");
+                endpoint.CircuitBreaker.RecordFailure();
+ 
+                if (attempt == _retryPolicy.MaxAttempts - 1)
+                    return Fail(request, ex.Message, StatusCode.Unavailable);
             }
             finally
             {
-                endpoint.ActiveConns = Math.Max(0, endpoint.ActiveConns - 1);
+                Interlocked.Decrement(ref endpoint.ActiveConns);
             }
         }
-
-        return new RpcResponse(request.RequestId, false, "", "All retries exhausted");
+ 
+        return Fail(request, "Esgotadas as tentativas", StatusCode.Unavailable);
+    }
+ 
+    private static RpcResponse Fail(RpcRequest req, string err, StatusCode code) =>
+        new(req.RequestId, false, "", err, code);
+ 
+    // Simula latência e erros de rede (5% de chance de falha)
+    private static async Task SimulateNetworkAsync(ServiceEndpoint ep)
+    {
+        await Task.Delay(Random.Shared.Next(5, 80));
+        if (Random.Shared.NextDouble() < 0.05)
+            throw new SimulatedNetworkException($"Connection reset by {ep.Address}");
     }
 }
-
+ 
+public sealed class SimulatedNetworkException : Exception
+{
+    public SimulatedNetworkException(string msg) : base(msg) { }
+}
+ 
 // ────────────────────────────────────────────────────────────
-// 5. SERVIÇOS DE EXEMPLO
+// 9. SERVIÇOS DE EXEMPLO
 // ────────────────────────────────────────────────────────────
-
-/// <summary>Serviço fictício de usuários.</summary>
+ 
 public sealed class UserService : IRpcHandler
 {
     public string ServiceName => "UserService";
-
+ 
     private static readonly Dictionary<string, string> _db = new()
     {
-        ["1"] = """{"id":"1","name":"Gustavo","role":"dev"}""",
-        ["2"] = """{"id":"2","name":"Ana","role":"sre"}""",
+        ["1"] = """{"id":"1","name":"Gustavo","role":"dev","team":"platform"}""",
+        ["2"] = """{"id":"2","name":"Ana",    "role":"sre","team":"infra"}""",
+        ["3"] = """{"id":"3","name":"Leo",    "role":"dev","team":"mobile"}""",
     };
-
-    public Task<RpcResponse> HandleAsync(RpcRequest req)
-    {
-        var result = req.Method switch
+ 
+    public Task<RpcResponse> HandleAsync(RpcRequest req) =>
+        Task.FromResult(req.Method switch
         {
-            "GetUser" => _db.TryGetValue(req.Payload, out var user)
-                            ? new RpcResponse(req.RequestId, true, user)
-                            : new RpcResponse(req.RequestId, false, "", "User not found"),
-
-            "ListUsers" => new RpcResponse(req.RequestId, true,
-                               $"[{string.Join(",", _db.Values)}]"),
-
-            _ => new RpcResponse(req.RequestId, false, "", $"Unknown method: {req.Method}")
-        };
-
-        return Task.FromResult(result);
+            "GetUser" => _db.TryGetValue(req.Payload, out var u)
+                ? Ok(req, u)
+                : Err(req, "User not found", StatusCode.NotFound),
+ 
+            "ListUsers" => Ok(req, $"[{string.Join(",", _db.Values)}]"),
+ 
+            "CreateUser" => HandleCreate(req),
+ 
+            _ => Err(req, $"Unknown method: {req.Method}", StatusCode.InvalidArgument)
+        });
+ 
+    private static RpcResponse HandleCreate(RpcRequest req)
+    {
+        try
+        {
+            var doc  = JsonDocument.Parse(req.Payload);
+            var id   = doc.RootElement.GetProperty("id").GetString() ?? "";
+            _db[id]  = req.Payload;
+            return Ok(req, req.Payload);
+        }
+        catch
+        {
+            return Err(req, "Invalid payload JSON", StatusCode.InvalidArgument);
+        }
     }
+ 
+    private static RpcResponse Ok (RpcRequest req, string payload) =>
+        new(req.RequestId, true,  payload, Status: StatusCode.Ok);
+    private static RpcResponse Err(RpcRequest req, string error, StatusCode code) =>
+        new(req.RequestId, false, "", error, code);
 }
-
-/// <summary>Serviço fictício de produtos.</summary>
+ 
 public sealed class ProductService : IRpcHandler
 {
     public string ServiceName => "ProductService";
-
-    public Task<RpcResponse> HandleAsync(RpcRequest req)
+ 
+    private readonly ConcurrentDictionary<string, decimal> _prices = new()
     {
-        var payload = req.Method switch
+        ["42"] = 9.99m,
+        ["7"]  = 49.90m,
+        ["99"] = 199.00m,
+    };
+ 
+    public Task<RpcResponse> HandleAsync(RpcRequest req) =>
+        Task.FromResult(req.Method switch
         {
-            "GetProduct" => $"""{{ "id":"{req.Payload}", "name":"Widget #{req.Payload}", "price":9.99 }}""",
-            _            => null
-        };
-
-        var response = payload is not null
-            ? new RpcResponse(req.RequestId, true, payload)
-            : new RpcResponse(req.RequestId, false, "", $"Unknown method: {req.Method}");
-
-        return Task.FromResult(response);
+            "GetProduct" => _prices.TryGetValue(req.Payload, out var price)
+                ? new(req.RequestId, true,
+                    $"""{{ "id":"{req.Payload}", "name":"Widget #{req.Payload}", "price":{price:F2} }}""",
+                    Status: StatusCode.Ok)
+                : new(req.RequestId, false, "", "Product not found", StatusCode.NotFound),
+ 
+            "UpdatePrice" => HandleUpdatePrice(req),
+ 
+            _ => new(req.RequestId, false, "",
+                     $"Unknown method: {req.Method}", StatusCode.InvalidArgument)
+        });
+ 
+    private RpcResponse HandleUpdatePrice(RpcRequest req)
+    {
+        try
+        {
+            var doc   = JsonDocument.Parse(req.Payload);
+            var id    = doc.RootElement.GetProperty("id").GetString() ?? "";
+            var price = doc.RootElement.GetProperty("price").GetDecimal();
+            _prices[id] = price;
+            return new(req.RequestId, true,
+                       $"""{{ "id":"{id}", "price":{price:F2} }}""",
+                       Status: StatusCode.Ok);
+        }
+        catch
+        {
+            return new(req.RequestId, false, "",
+                       "Invalid payload", StatusCode.InvalidArgument);
+        }
     }
 }
-
+ 
 // ────────────────────────────────────────────────────────────
-// 6. BOOTSTRAP / DEMO
+// 10. BOOTSTRAP / DEMO
 // ────────────────────────────────────────────────────────────
-
+ 
 public static class Program
 {
     public static async Task Main()
     {
-        Console.WriteLine("=== Distributed Services Core ===\n");
-
-        // --- Registry ---
-        var registry = new ServiceRegistry();
-
-        // Registra 3 instâncias do UserService e 2 do ProductService
-        registry.Register(new ServiceEndpoint("user-01", "UserService",    "10.0.0.1:9000"));
-        registry.Register(new ServiceEndpoint("user-02", "UserService",    "10.0.0.2:9000"));
-        registry.Register(new ServiceEndpoint("user-03", "UserService",    "10.0.0.3:9000"));
-        registry.Register(new ServiceEndpoint("prod-01", "ProductService", "10.0.0.4:9001"));
-        registry.Register(new ServiceEndpoint("prod-02", "ProductService", "10.0.0.5:9001"));
-
-        // --- Load Balancer ---
-        var lb = new LoadBalancer(registry, LbStrategy.RoundRobin);
-
-        // --- Canal RPC ---
-        var channel = new RpcChannel(lb);
+        Console.WriteLine("╔══════════════════════════════════════════╗");
+        Console.WriteLine("║   Distributed Services Core  (v2)        ║");
+        Console.WriteLine("╚══════════════════════════════════════════╝\n");
+ 
+        var metrics = new MetricsCollector();
+ 
+        await using var registry = new ServiceRegistry(TimeSpan.FromSeconds(4));
+ 
+        registry.Register(new ServiceEndpoint("user-01", "UserService",    "10.0.0.1:9000", failureThreshold: 2));
+        registry.Register(new ServiceEndpoint("user-02", "UserService",    "10.0.0.2:9000", failureThreshold: 2));
+        registry.Register(new ServiceEndpoint("user-03", "UserService",    "10.0.0.3:9000", failureThreshold: 2));
+        registry.Register(new ServiceEndpoint("prod-01", "ProductService", "10.0.0.4:9001", failureThreshold: 2));
+        registry.Register(new ServiceEndpoint("prod-02", "ProductService", "10.0.0.5:9001", failureThreshold: 2));
+ 
+        // ── Load Balancer — Power of Two Choices ──────────────
+        var lb = new LoadBalancer(registry, LbStrategy.PowerOfTwo);
+ 
+        // ── Middleware Pipeline ───────────────────────────────
+        var timeout = new TimeoutMiddleware(TimeSpan.FromMilliseconds(300));
+        var mwMetrics = new MetricsMiddleware(metrics);
+ 
+        var pipeline = new MiddlewarePipeline()
+            .Use(ValidationMiddleware.InvokeAsync)
+            .Use(LoggingMiddleware.InvokeAsync)
+            .Use(mwMetrics.InvokeAsync)
+            .Use(timeout.InvokeAsync);
+ 
+        // ── Canal RPC ─────────────────────────────────────────
+        var retryPolicy = new RetryPolicy
+        {
+            MaxAttempts = 3,
+            BaseDelay   = TimeSpan.FromMilliseconds(50),
+            MaxDelay    = TimeSpan.FromMilliseconds(500),
+        };
+ 
+        var channel = new RpcChannel(lb, retryPolicy, pipeline);
         channel.RegisterHandler(new UserService());
         channel.RegisterHandler(new ProductService());
-
-        // --- Disparar chamadas concorrentes ---
-        Console.WriteLine("\n--- Chamadas RPC concorrentes ---\n");
-
-        var tasks = new List<Task<RpcResponse>>
-        {
+ 
+        // ════════════════════════════════════════════════════════
+        // Batch 1 — Chamadas concorrentes normais
+        // ════════════════════════════════════════════════════════
+        Console.WriteLine("\n─── Batch 1: chamadas concorrentes ─────────────\n");
+ 
+        var batch1 = await Task.WhenAll(
             channel.CallAsync(new RpcRequest("UserService",    "GetUser",    "1")),
             channel.CallAsync(new RpcRequest("UserService",    "GetUser",    "2")),
             channel.CallAsync(new RpcRequest("UserService",    "ListUsers",  "")),
-            channel.CallAsync(new RpcRequest("UserService",    "GetUser",    "99")), // not found
+            channel.CallAsync(new RpcRequest("UserService",    "GetUser",    "99")),   // NotFound
             channel.CallAsync(new RpcRequest("ProductService", "GetProduct", "42")),
             channel.CallAsync(new RpcRequest("ProductService", "GetProduct", "7")),
-            channel.CallAsync(new RpcRequest("ProductService", "DeleteAll",  "")),  // unknown method
-        };
-
-        var results = await Task.WhenAll(tasks);
-
-        Console.WriteLine("\n--- Resultados ---\n");
+            channel.CallAsync(new RpcRequest("ProductService", "DeleteAll",  "")),     // método inválido
+            channel.CallAsync(new RpcRequest("",               "Whatever",   ""))      // inválido → ValidationMW
+        );
+ 
+        PrintResults("Batch 1", batch1);
+ 
+        // ════════════════════════════════════════════════════════
+        // Batch 2 — Mutations
+        // ════════════════════════════════════════════════════════
+        Console.WriteLine("\n─── Batch 2: mutations ──────────────────────────\n");
+ 
+        var batch2 = await Task.WhenAll(
+            channel.CallAsync(new RpcRequest("UserService",
+                "CreateUser", """{"id":"4","name":"Clara","role":"pm"}""")),
+ 
+            channel.CallAsync(new RpcRequest("ProductService",
+                "UpdatePrice", """{"id":"42","price":14.99}""")),
+ 
+            channel.CallAsync(new RpcRequest("ProductService",
+                "GetProduct", "42"))   // deve refletir o novo preço
+        );
+ 
+        PrintResults("Batch 2", batch2);
+ 
+        // ════════════════════════════════════════════════════════
+        // Batch 3 — Stress: 20 chamadas paralelas
+        // ════════════════════════════════════════════════════════
+        Console.WriteLine("\n─── Batch 3: stress (20 chamadas) ──────────────\n");
+ 
+        var stress = Enumerable.Range(1, 20).Select(i =>
+            channel.CallAsync(new RpcRequest("UserService", "GetUser",
+                (i % 4 + 1).ToString())));
+ 
+        var stressResults = await Task.WhenAll(stress);
+        var ok  = stressResults.Count(r => r.Success);
+        var err = stressResults.Length - ok;
+        Console.WriteLine($"  Stress result: {ok} OK / {err} ERR de {stressResults.Length} chamadas");
+ 
+        // ════════════════════════════════════════════════════════
+        // Estado dos endpoints após tudo
+        // ════════════════════════════════════════════════════════
+        Console.WriteLine("\n─── Estado final dos endpoints ─────────────────\n");
+        foreach (var ep in registry.All("UserService"))
+            Console.WriteLine($"  UserService    {ep}");
+        foreach (var ep in registry.All("ProductService"))
+            Console.WriteLine($"  ProductService {ep}");
+ 
+        // ════════════════════════════════════════════════════════
+        // Relatório de métricas
+        // ════════════════════════════════════════════════════════
+        metrics.PrintReport();
+ 
+        Console.WriteLine("=== Done ===");
+    }
+ 
+    private static void PrintResults(string label, RpcResponse[] results)
+    {
+        Console.WriteLine($"\n  Resultados [{label}]:");
         foreach (var r in results)
         {
-            var status = r.Success ? "✓" : "✗";
-            var body   = r.Success ? r.Payload : r.Error;
-            Console.WriteLine($"  {status} [{r.RequestId}] {body}");
+            var icon = r.Success ? "✓" : "✗";
+            var body = r.Success ? Truncate(r.Payload, 60) : r.Error;
+            Console.WriteLine($"    {icon} [{r.RequestId}] [{r.Status}] {body}  ({r.LatencyMs}ms)");
         }
-
-        // --- Simula health check e nova rodada ---
-        Console.WriteLine("\n--- Health check simulado ---\n");
-        registry.SimulateHealthCheck();
-
-        Console.WriteLine("Endpoints após health check:");
-        foreach (var ep in registry.Resolve("UserService"))
-            Console.WriteLine($"  {ep}");
-
-        // Resolve() com Least-Connections
-        var lb2    = new LoadBalancer(registry, LbStrategy.LeastConnections);
-        var ch2    = new RpcChannel(lb2);
-        ch2.RegisterHandler(new UserService());
-
-        Console.WriteLine("\n--- Least-Connections LB ---\n");
-        var lc = await Task.WhenAll(
-            ch2.CallAsync(new RpcRequest("UserService", "GetUser", "1")),
-            ch2.CallAsync(new RpcRequest("UserService", "GetUser", "2"))
-        );
-        foreach (var r in lc)
-            Console.WriteLine($"  [{r.RequestId}] {(r.Success ? r.Payload : r.Error)}");
-
-        Console.WriteLine("\n=== Done ===");
     }
+ 
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
 }
